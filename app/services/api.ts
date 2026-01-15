@@ -1,7 +1,21 @@
 import { ProcessingResult } from '../types';
 
-// Endereço da API Docker
-const API_BASE = 'http://localhost:3001';
+// Detecta automaticamente se está em produção (servidor remoto) ou desenvolvimento
+export const getApiBase = (): string => {
+  // Se estiver rodando no navegador e acessando via IP, usa o mesmo hostname
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname;
+    // Se não for localhost, usa o mesmo hostname do frontend
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
+      return `http://${hostname}:3001`;
+    }
+  }
+  // Fallback para localhost em desenvolvimento
+  return 'http://localhost:3001';
+};
+
+// Endereço da API Docker - detecta automaticamente
+const API_BASE = getApiBase();
 
 export const checkBackendHealth = async (): Promise<boolean> => {
   try {
@@ -115,7 +129,7 @@ export const accelerateVideo = async (
     });
     
     xhr.addEventListener('error', () => {
-      reject(new Error('Erro de conexão. Verifique se o servidor está rodando em http://localhost:3001'));
+      reject(new Error(`Erro de conexão. Verifique se o servidor está rodando em ${API_BASE}`));
     });
     
     xhr.addEventListener('timeout', () => {

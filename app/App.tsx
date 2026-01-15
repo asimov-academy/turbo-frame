@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Dropzone } from './components/Dropzone';
 import { ProcessingStatus, VideoFile, ProcessingResult } from './types';
-import { accelerateVideo, checkBackendHealth } from './services/api';
+import { accelerateVideo, checkBackendHealth, getApiBase } from './services/api';
 import { 
   ZapIcon, 
   FileVideoIcon, 
@@ -312,7 +312,7 @@ const App: React.FC = () => {
                   
                   {!isBackendOnline && (
                     <p className="text-[10px] text-red-400 text-center">
-                      Certifique-se que o Docker está rodando em http://localhost:3001
+                      Certifique-se que o Docker está rodando em {getApiBase()}
                     </p>
                   )}
                 </div>
