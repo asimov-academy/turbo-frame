@@ -1,7 +1,7 @@
 import { ProcessingResult } from '../types';
 
 // Endereço da API Docker
-const API_BASE = 'http://localhost:8888';
+const API_BASE = 'http://localhost:3001';
 
 export const checkBackendHealth = async (): Promise<boolean> => {
   try {
@@ -115,7 +115,7 @@ export const accelerateVideo = async (
     });
     
     xhr.addEventListener('error', () => {
-      reject(new Error('Erro de conexão. Verifique se o servidor está rodando em http://localhost:8888'));
+      reject(new Error('Erro de conexão. Verifique se o servidor está rodando em http://localhost:3001'));
     });
     
     xhr.addEventListener('timeout', () => {

@@ -312,7 +312,7 @@ const App: React.FC = () => {
                   
                   {!isBackendOnline && (
                     <p className="text-[10px] text-red-400 text-center">
-                      Certifique-se que o Docker está rodando em http://localhost:8888
+                      Certifique-se que o Docker está rodando em http://localhost:3001
                     </p>
                   )}
                 </div>

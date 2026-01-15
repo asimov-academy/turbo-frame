@@ -81,10 +81,10 @@ Após iniciar a aplicação, você terá acesso a:
 | Serviço | URL | Descrição |
 |---------|-----|-----------|
 | 🎬 **Frontend** | http://localhost:3000 | Interface principal da aplicação |
-| 🔌 **API** | http://localhost:8888 | API REST principal |
-| 📚 **Swagger Docs** | http://localhost:8888/docs | Documentação interativa da API |
-| 📖 **ReDoc** | http://localhost:8888/redoc | Documentação alternativa da API |
-| ❤️ **Health Check** | http://localhost:8888/health | Verificação de saúde da API |
+| 🔌 **API** | http://localhost:3001 | API REST principal |
+| 📚 **Swagger Docs** | http://localhost:3001/docs | Documentação interativa da API |
+| 📖 **ReDoc** | http://localhost:3001/redoc | Documentação alternativa da API |
+| ❤️ **Health Check** | http://localhost:3001/health | Verificação de saúde da API |
 
 ## 📡 API Endpoints
 
@@ -159,7 +159,7 @@ ports:
   - "SUA_PORTA:8000"
 ```
 
-**Nota:** A porta interna do container permanece 8000. A porta externa (8888) é mapeada no docker-compose.
+**Nota:** A porta interna do container permanece 8000. A porta externa (3001) é mapeada no docker-compose.
 
 ### Alterar Porta do Frontend
 

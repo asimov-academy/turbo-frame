@@ -41,9 +41,9 @@ INFO = "blue"
 HIGHLIGHT = "cyan"
 
 # URLs da aplicação
-API_URL = "http://localhost:8888"
-API_DOCS_SWAGGER = "http://localhost:8888/docs"
-API_DOCS_REDOC = "http://localhost:8888/redoc"
+API_URL = "http://localhost:3001"
+API_DOCS_SWAGGER = "http://localhost:3001/docs"
+API_DOCS_REDOC = "http://localhost:3001/redoc"
 FRONTEND_URL = "http://localhost:3000"
 
 # Diretórios
