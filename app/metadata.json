@@ -1,0 +1,4 @@
+{
+  "name": "TurboFrame Video Accelerator",
+  "description": "A modern React frontend for accelerating video playback speed using FFmpeg backend logic."
+}
