@@ -1,160 +1,304 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Dropzone } from './components/Dropzone';
-import { ProcessingStatus, VideoFile, ProcessingResult } from './types';
+import {
+  ProcessingStatus,
+  VideoMetadata,
+  ProcessingResult,
+  QueueItem,
+  QualityPreset,
+  QUALITY_PRESETS,
+} from './types';
 import { accelerateVideo, checkBackendHealth, getApiBase } from './services/api';
-import { 
-  ZapIcon, 
-  FileVideoIcon, 
-  TrashIcon, 
-  Loader2Icon, 
-  CheckCircleIcon, 
+import {
+  ZapIcon,
+  FileVideoIcon,
+  Loader2Icon,
+  CheckCircleIcon,
   DownloadIcon,
   PlayIcon,
   ServerIcon,
-  LayersIcon,
-  ClockIcon
+  VolumeXIcon,
+  Volume2Icon,
+  BellIcon,
+  XIcon,
+  RefreshIcon,
+  PlayCircleIcon,
 } from './components/Icons';
 
-const App: React.FC = () => {
-  const [videoFile, setVideoFile] = useState<VideoFile | null>(null);
-  const [speed, setSpeed] = useState<number | string>(1.5); // Allow string for typing handling
-  const [status, setStatus] = useState<ProcessingStatus>(ProcessingStatus.IDLE);
-  const [result, setResult] = useState<ProcessingResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isBackendOnline, setIsBackendOnline] = useState<boolean>(false);
-  
-  // UX Features States
-  const [simulatedProgress, setSimulatedProgress] = useState(0);
-  const [viewMode, setViewMode] = useState<'original' | 'processed'>('processed');
-  
-  const videoRef = useRef<HTMLVideoElement>(null);
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
-  // Health Check Loop
-  useEffect(() => {
-    const check = async () => {
-      const online = await checkBackendHealth();
-      setIsBackendOnline(online);
+const formatDuration = (seconds: number): string => {
+  if (!isFinite(seconds) || seconds < 0) return '--:--';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) {
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
+
+const extractMetadata = (file: File): Promise<VideoMetadata> =>
+  new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      resolve({
+        duration: video.duration,
+        width: video.videoWidth,
+        height: video.videoHeight,
+        sizeMb: file.size / (1024 * 1024),
+      });
+      URL.revokeObjectURL(video.src);
     };
+    video.onerror = () => reject(new Error('Falha ao ler metadados'));
+    video.src = URL.createObjectURL(file);
+  });
+
+const extractThumbnail = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    const canvas = document.createElement('canvas');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      video.currentTime = Math.min(1, video.duration);
+    };
+    video.onseeked = () => {
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { reject(new Error('Canvas não suportado')); return; }
+      ctx.drawImage(video, 0, 0);
+      URL.revokeObjectURL(video.src);
+      resolve(canvas.toDataURL('image/jpeg', 0.8));
+    };
+    video.onerror = () => reject(new Error('Falha ao extrair thumbnail'));
+    video.src = URL.createObjectURL(file);
+  });
+
+// ─── Status badge ────────────────────────────────────────────────────────────
+
+const STATUS_CONFIG: Record<ProcessingStatus, { label: string; className: string }> = {
+  [ProcessingStatus.IDLE]:       { label: 'AGUARDANDO',  className: 'text-slate-500 bg-slate-900/80' },
+  [ProcessingStatus.QUEUED]:     { label: 'NA FILA',     className: 'text-amber-400 bg-amber-950/40 animate-pulse' },
+  [ProcessingStatus.PROCESSING]: { label: 'PROCESSANDO', className: 'text-cyan-400 bg-cyan-950/40' },
+  [ProcessingStatus.COMPLETED]:  { label: 'CONCLUÍDO',   className: 'text-green-400 bg-green-950/40' },
+  [ProcessingStatus.ERROR]:      { label: 'ERRO',        className: 'text-red-400 bg-red-950/40' },
+  [ProcessingStatus.CANCELLED]:  { label: 'CANCELADO',   className: 'text-slate-400 bg-slate-900/80' },
+};
+
+const StatusBadge: React.FC<{ status: ProcessingStatus }> = ({ status }) => {
+  const c = STATUS_CONFIG[status];
+  return (
+    <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded-full border border-white/5 whitespace-nowrap ${c.className}`}>
+      {c.label}
+    </span>
+  );
+};
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+
+const App: React.FC = () => {
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+
+  // Default settings applied to every new file added
+  const [defaults, setDefaults] = useState<{
+    speed: number;
+    qualityPreset: QualityPreset;
+    muteAudio: boolean;
+  }>({ speed: 1.5, qualityPreset: 'balanceado', muteAudio: false });
+
+  const [autoDownload, setAutoDownload] = useState(false);
+  const [isBackendOnline, setIsBackendOnline] = useState(false);
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>(
+    typeof Notification !== 'undefined' ? Notification.permission : 'denied'
+  );
+  const [previewItemId, setPreviewItemId] = useState<string | null>(null);
+
+  // ── Derived counts ──────────────────────────────────────────────────────────
+  const idleCount      = queue.filter(i => i.status === ProcessingStatus.IDLE).length;
+  const completedCount = queue.filter(i => i.status === ProcessingStatus.COMPLETED).length;
+  const activeCount    = queue.filter(i =>
+    i.status === ProcessingStatus.PROCESSING || i.status === ProcessingStatus.QUEUED
+  ).length;
+
+  // ── Health check ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const check = async () => setIsBackendOnline(await checkBackendHealth());
     check();
     const interval = setInterval(check, 5000);
     return () => clearInterval(interval);
   }, []);
 
-  const handleFileSelect = (file: File) => {
-    if (result?.downloadUrl) URL.revokeObjectURL(result.downloadUrl);
-    if (videoFile?.previewUrl) URL.revokeObjectURL(videoFile.previewUrl);
-    
-    setResult(null);
-    setStatus(ProcessingStatus.IDLE);
-    setError(null);
-    setSimulatedProgress(0);
-    setViewMode('processed'); // Default but won't show until processed
+  // ── Item updater ────────────────────────────────────────────────────────────
+  const updateItem = useCallback((id: string, updates: Partial<QueueItem>) => {
+    setQueue(prev => prev.map(item => item.id === id ? { ...item, ...updates } : item));
+  }, []);
 
-    const previewUrl = URL.createObjectURL(file);
-    setVideoFile({ file, previewUrl });
-  };
-
-  const handleRemoveFile = () => {
-    if (videoFile?.previewUrl) URL.revokeObjectURL(videoFile.previewUrl);
-    if (result?.downloadUrl) URL.revokeObjectURL(result.downloadUrl);
-    
-    setVideoFile(null);
-    setResult(null);
-    setStatus(ProcessingStatus.IDLE);
-    setSimulatedProgress(0);
-  };
-
-  const handleProcess = async () => {
-    if (!videoFile) return;
-
-    // Validate Speed
-    const numericSpeed = Number(speed);
-    if (isNaN(numericSpeed) || numericSpeed <= 0 || numericSpeed > 10) {
-      setError("Por favor, insira uma velocidade válida entre 0.1 e 10");
-      setStatus(ProcessingStatus.ERROR);
-      return;
-    }
-
-    setStatus(ProcessingStatus.PROCESSING);
-    setError(null);
-    setSimulatedProgress(0);
-    setViewMode('processed');
-
-    // Progresso de fallback caso não receba eventos de progresso
-    const fallbackInterval = setInterval(() => {
-      setSimulatedProgress(prev => {
-        // Se já está em 90% ou mais, não incrementa mais (aguarda resposta real)
-        if (prev >= 90) return prev;
-        // Incremento mais lento para não chegar muito rápido em 90%
-        const increment = prev < 30 ? 2 : prev < 60 ? 1 : 0.3;
-        return Math.min(prev + increment, 90);
+  // ── Add files to queue ──────────────────────────────────────────────────────
+  const handleFilesSelect = (files: File[]) => {
+    const toAdd: QueueItem[] = [];
+    for (const file of files) {
+      if (file.size > 10 * 1024 * 1024 * 1024) continue;
+      const id = crypto.randomUUID();
+      const previewUrl = URL.createObjectURL(file);
+      toAdd.push({
+        id, file, previewUrl,
+        speed: defaults.speed,
+        qualityPreset: defaults.qualityPreset,
+        muteAudio: defaults.muteAudio,
+        status: ProcessingStatus.IDLE,
+        progress: 0,
+        abortController: null,
       });
+      extractMetadata(file).then(m => updateItem(id, { metadata: m })).catch(() => {});
+      extractThumbnail(file).then(t => updateItem(id, { thumbnailUrl: t })).catch(() => {});
+    }
+    if (toAdd.length) setQueue(prev => [...prev, ...toAdd]);
+  };
+
+  // ── Remove one item ─────────────────────────────────────────────────────────
+  const handleRemoveItem = (id: string) => {
+    if (previewItemId === id) setPreviewItemId(null);
+    setQueue(prev => {
+      const item = prev.find(i => i.id === id);
+      if (item) {
+        item.abortController?.abort();
+        URL.revokeObjectURL(item.previewUrl);
+        if (item.result?.downloadUrl) URL.revokeObjectURL(item.result.downloadUrl);
+      }
+      return prev.filter(i => i.id !== id);
+    });
+  };
+
+  // ── Clear all completed ─────────────────────────────────────────────────────
+  const handleClearCompleted = () => {
+    setQueue(prev => {
+      prev.filter(i => i.status === ProcessingStatus.COMPLETED)
+          .forEach(i => { if (i.result?.downloadUrl) URL.revokeObjectURL(i.result.downloadUrl); });
+      return prev.filter(i => i.status !== ProcessingStatus.COMPLETED);
+    });
+  };
+
+  // ── Clear entire queue ──────────────────────────────────────────────────────
+  const handleClearAll = () => {
+    setPreviewItemId(null);
+    setQueue(prev => {
+      prev.forEach(i => {
+        i.abortController?.abort();
+        URL.revokeObjectURL(i.previewUrl);
+        if (i.result?.downloadUrl) URL.revokeObjectURL(i.result.downloadUrl);
+      });
+      return [];
+    });
+  };
+
+  // ── Process a single queue item ─────────────────────────────────────────────
+  const processItem = async (itemId: string) => {
+    const item = queue.find(i => i.id === itemId);
+    if (!item || item.status !== ProcessingStatus.IDLE) return;
+
+    const { preset, crf } = QUALITY_PRESETS[item.qualityPreset];
+    const controller = new AbortController();
+
+    updateItem(itemId, {
+      status: ProcessingStatus.PROCESSING,
+      progress: 0,
+      error: undefined,
+      abortController: controller,
+    });
+
+    let lastFallbackProg = 0;
+    let usingRealProgress = false;
+    const fallbackInterval = setInterval(() => {
+      if (usingRealProgress) return;
+      lastFallbackProg = Math.min(
+        lastFallbackProg + (lastFallbackProg < 30 ? 2 : lastFallbackProg < 60 ? 1 : 0.3),
+        90,
+      );
+      updateItem(itemId, { progress: lastFallbackProg });
     }, 500);
 
     try {
       const data = await accelerateVideo(
-        videoFile.file, 
-        numericSpeed,
-        (progress, message) => {
-          // Progresso real do upload + processamento FFmpeg
+        item.file,
+        item.speed,
+        (progress, _message, backendStatus) => {
+          usingRealProgress = true;
           clearInterval(fallbackInterval);
-          setSimulatedProgress(Math.min(progress, 99));
-          // Opcional: mostrar mensagem de progresso
-          if (message) {
-            console.log(`Progresso: ${Math.round(progress)}% - ${message}`);
-          }
-        }
+          updateItem(itemId, {
+            progress: Math.min(progress, 99),
+            status: backendStatus === 'queued'
+              ? ProcessingStatus.QUEUED
+              : ProcessingStatus.PROCESSING,
+          });
+        },
+        controller.signal,
+        { preset, crf, muteAudio: item.muteAudio },
       );
-      
+
       clearInterval(fallbackInterval);
-      setSimulatedProgress(100);
-      
-      setTimeout(() => {
-        setResult(data);
-        setStatus(ProcessingStatus.COMPLETED);
-      }, 500);
-      
-    } catch (err: any) {
+      updateItem(itemId, {
+        status: ProcessingStatus.COMPLETED,
+        progress: 100,
+        result: data,
+        abortController: null,
+      });
+
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        new Notification('TurboFrame — Pronto!', {
+          body: `"${item.file.name}" processado com sucesso.`,
+          icon: '/favicon.ico',
+        });
+      }
+
+      if (autoDownload) triggerDownload(data.downloadUrl, data.processedName);
+
+    } catch (err: unknown) {
       clearInterval(fallbackInterval);
-      console.error("Erro ao processar vídeo:", err);
-      setError(err.message || "Erro desconhecido ao processar");
-      setStatus(ProcessingStatus.ERROR);
-      setSimulatedProgress(0);
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        updateItem(itemId, { status: ProcessingStatus.IDLE, progress: 0, abortController: null });
+      } else {
+        const message = err instanceof Error ? err.message : 'Erro desconhecido';
+        updateItem(itemId, { status: ProcessingStatus.ERROR, error: message, abortController: null });
+      }
     }
   };
 
-  const handleManualSpeedChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    // Allow empty string for backspacing everything
-    if (val === '') {
-      setSpeed('');
-      return;
-    }
-    // Only allow numbers and one decimal point
-    if (/^\d*\.?\d*$/.test(val)) {
-       setSpeed(val);
-    }
+  const handleProcessAll = () => {
+    queue.filter(i => i.status === ProcessingStatus.IDLE).forEach(i => processItem(i.id));
   };
 
-  const getSpeedNumber = () => {
-    const n = Number(speed);
-    return isNaN(n) ? 1.0 : n;
+  const triggerDownload = (url: string, filename: string) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
+
+  const requestNotificationPermission = async () => {
+    if (typeof Notification === 'undefined') return;
+    setNotifPermission(await Notification.requestPermission());
+  };
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  const previewItem = previewItemId ? queue.find(i => i.id === previewItemId) ?? null : null;
 
   return (
     <div className="min-h-screen text-slate-100 font-sans selection:bg-cyber-purple/30 pb-20">
-      
-      {/* Background Ambience */}
+
+      {/* Background */}
       <div className="fixed inset-0 pointer-events-none z-0">
         <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full max-w-4xl h-[500px] bg-cyber-purple/10 blur-[120px] rounded-full mix-blend-screen"></div>
         <div className="absolute bottom-0 right-0 w-[500px] h-[500px] bg-cyber-blue/10 blur-[100px] rounded-full mix-blend-screen"></div>
       </div>
 
-      {/* Header */}
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="relative z-10 border-b border-white/5 bg-cyber-panel/50 backdrop-blur-xl">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center space-x-3 select-none">
-            {/* LOGO CONTAINER with Hover Glow */}
             <div className="relative group cursor-default">
               <div className="absolute inset-0 bg-metallic-gradient blur opacity-20 group-hover:opacity-50 transition duration-500 rounded-lg"></div>
               <div className="relative p-2 bg-black rounded-lg border border-white/10 group-hover:border-yellow-400/50 transition-colors duration-300">
@@ -168,292 +312,478 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          <div className="flex items-center space-x-3 bg-black/40 px-4 py-1.5 rounded-full border border-white/5 backdrop-blur-md">
-             <ServerIcon className={`w-4 h-4 ${isBackendOnline ? 'text-green-400' : 'text-red-500'}`} />
-             <div className="flex flex-col">
-               <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Status da Engine</span>
-               <span className={`text-xs font-medium ${isBackendOnline ? 'text-green-400' : 'text-red-400'}`}>
-                 {isBackendOnline ? 'ONLINE' : 'DESCONECTADO'}
-               </span>
-             </div>
+          <div className="flex items-center space-x-3">
+            {typeof Notification !== 'undefined' && notifPermission === 'default' && (
+              <button
+                onClick={requestNotificationPermission}
+                title="Ativar notificações"
+                className="flex items-center space-x-2 bg-black/40 px-3 py-1.5 rounded-full border border-white/5 hover:border-cyber-purple/50 transition text-slate-400 hover:text-white"
+              >
+                <BellIcon className="w-4 h-4" />
+                <span className="text-xs hidden sm:inline">Notificações</span>
+              </button>
+            )}
+            {notifPermission === 'granted' && (
+              <div title="Notificações ativas" className="text-green-400/50">
+                <BellIcon className="w-4 h-4" />
+              </div>
+            )}
+
+            <div className="flex items-center space-x-3 bg-black/40 px-4 py-1.5 rounded-full border border-white/5 backdrop-blur-md">
+              <ServerIcon className={`w-4 h-4 ${isBackendOnline ? 'text-green-400' : 'text-red-500'}`} />
+              <div className="flex flex-col">
+                <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Engine</span>
+                <span className={`text-xs font-medium ${isBackendOnline ? 'text-green-400' : 'text-red-400'}`}>
+                  {isBackendOnline ? 'ONLINE' : 'DESCONECTADO'}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
       </header>
 
-      <main className="relative z-10 max-w-7xl mx-auto px-6 py-12">
-        
-        {/* Main Grid */}
+      <main className="relative z-10 max-w-7xl mx-auto px-6 py-10">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-          
-          {/* LEFT: Configuration & Input */}
-          <div className="lg:col-span-5 space-y-8">
-            
-            {/* Upload Section */}
-            <div className="space-y-4">
-              <div className="flex justify-between items-end">
-                <h2 className="text-xl font-display font-semibold text-white flex items-center">
-                  <span className="w-1.5 h-6 bg-metallic-gradient mr-3 rounded-full"></span>
-                  ARQUIVO FONTE
-                </h2>
-                {videoFile && (
-                  <button onClick={handleRemoveFile} className="text-xs text-red-400 hover:text-red-300 transition flex items-center bg-red-950/20 px-2 py-1 rounded border border-red-900/30">
-                    <TrashIcon className="w-3 h-3 mr-1"/> LIMPAR
-                  </button>
-                )}
-              </div>
-              
-              {!videoFile ? (
-                <Dropzone onFileSelect={handleFileSelect} />
-              ) : (
-                <div className="relative group rounded-xl overflow-hidden border border-white/10 bg-black shadow-2xl transition-all duration-300 hover:border-cyber-purple/50">
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent pointer-events-none z-10"></div>
-                  {/* Small preview of source */}
-                  <video 
-                    src={videoFile.previewUrl} 
-                    className="w-full h-32 object-cover opacity-60 group-hover:opacity-80 transition duration-500"
-                  />
-                  <div className="absolute bottom-0 left-0 right-0 p-4 z-20 flex items-center justify-between">
-                    <div className="flex items-center space-x-3">
-                      <div className="p-2 bg-white/10 backdrop-blur rounded-lg border border-white/10">
-                        <FileVideoIcon className="w-5 h-5 text-white" />
-                      </div>
-                      <div>
-                        <p className="text-sm font-medium text-white truncate max-w-[200px]">{videoFile.file.name}</p>
-                        <p className="text-[10px] text-slate-400 font-mono">{(videoFile.file.size / (1024 * 1024)).toFixed(2)} MB</p>
-                      </div>
-                    </div>
-                    <div className="text-xs font-mono text-cyan-400 bg-cyan-950/30 px-2 py-1 rounded border border-cyan-500/20">
-                      PRONTO
-                    </div>
+
+          {/* ── LEFT: Dropzone + action ─────────────────────────────────── */}
+          <div className="lg:col-span-4 flex flex-col gap-5">
+
+            {/* Dropzone */}
+            {queue.length === 0 ? (
+              <Dropzone onFilesSelect={handleFilesSelect} />
+            ) : (
+              <Dropzone onFilesSelect={handleFilesSelect} compact />
+            )}
+
+            {/* Stats + actions */}
+            {queue.length > 0 && (
+              <div className="bg-black/30 border border-white/5 rounded-2xl p-4 space-y-4">
+                {/* Stats grid */}
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  <div className="bg-black/40 rounded-xl py-3">
+                    <p className="text-xl font-display font-bold text-white">{idleCount}</p>
+                    <p className="text-[9px] font-mono text-slate-500 uppercase tracking-wide mt-0.5">Na fila</p>
+                  </div>
+                  <div className="bg-black/40 rounded-xl py-3">
+                    <p className={`text-xl font-display font-bold ${activeCount > 0 ? 'text-cyan-400' : 'text-white'}`}>{activeCount}</p>
+                    <p className="text-[9px] font-mono text-slate-500 uppercase tracking-wide mt-0.5">Processando</p>
+                  </div>
+                  <div className="bg-black/40 rounded-xl py-3">
+                    <p className={`text-xl font-display font-bold ${completedCount > 0 ? 'text-green-400' : 'text-white'}`}>{completedCount}</p>
+                    <p className="text-[9px] font-mono text-slate-500 uppercase tracking-wide mt-0.5">Concluídos</p>
                   </div>
                 </div>
-              )}
-            </div>
 
-            {/* Controls Section (Glass Card) */}
-            <div className={`transition-all duration-500 transform ${videoFile ? 'opacity-100 translate-y-0' : 'opacity-40 translate-y-4 pointer-events-none grayscale'}`}>
-              <div className="bg-glass border border-white/10 rounded-2xl p-6 backdrop-blur-md relative overflow-hidden group">
-                {/* Decorative glow */}
-                <div className="absolute -top-10 -right-10 w-32 h-32 bg-cyber-purple/20 blur-[50px] rounded-full pointer-events-none transition duration-500 group-hover:bg-cyber-blue/20"></div>
-
-                <div className="space-y-6 relative z-10">
-                  <div className="flex justify-between items-center">
-                    <div className="flex items-center">
-                      <ClockIcon className="w-4 h-4 text-slate-400 mr-2" />
-                      <label className="text-sm font-display font-bold text-slate-300 uppercase tracking-widest">
-                        Fator de Velocidade
-                      </label>
-                    </div>
-                    
-                    {/* Manual Input Field */}
-                    <div className="relative group/input">
-                      <input 
-                        type="number"
-                        min="0.1"
-                        max="10"
-                        step="0.1"
-                        value={speed}
-                        onChange={handleManualSpeedChange}
-                        className="w-24 bg-black/50 border border-white/10 rounded-md py-1.5 pl-3 pr-8 text-right font-mono text-xl text-cyan-400 font-bold focus:outline-none focus:border-cyber-purple focus:shadow-[0_0_15px_rgba(124,58,237,0.3)] transition-all"
-                      />
-                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 font-mono text-sm pointer-events-none">x</span>
-                    </div>
+                {/* Auto-download toggle */}
+                <div className="flex items-center justify-between py-1">
+                  <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <DownloadIcon className="w-3.5 h-3.5" />
+                    Download automático
                   </div>
-
-                  {/* Range Slider */}
-                  <div className="py-2">
-                    <input
-                      type="range"
-                      min={0.1}
-                      max={5.0}
-                      step={0.1}
-                      value={getSpeedNumber()}
-                      onChange={(e) => setSpeed(Number(e.target.value))}
-                      className="w-full"
-                    />
-                  </div>
-
-                  {/* NOTE: Removed Preset Buttons as requested */}
-
-                  <div className="h-px bg-white/5 my-4"></div>
-
                   <button
-                    onClick={handleProcess}
-                    disabled={status === ProcessingStatus.PROCESSING || !isBackendOnline}
-                    className={`
-                      relative w-full py-4 rounded-xl font-display font-bold text-lg tracking-widest uppercase transition-all duration-300 overflow-hidden group
-                      ${status === ProcessingStatus.PROCESSING 
-                        ? 'bg-slate-800 text-slate-500 cursor-wait border border-white/5' 
-                        : !isBackendOnline 
-                          ? 'bg-red-900/20 text-red-500 border border-red-500/20 cursor-not-allowed'
-                          : 'text-white shadow-[0_0_20px_rgba(0,0,0,0.5)] hover:shadow-neon-purple'
-                      }
-                    `}
+                    onClick={() => setAutoDownload(p => !p)}
+                    className={`relative w-10 h-5 rounded-full transition-all duration-300 ${autoDownload ? 'bg-cyber-purple' : 'bg-white/10'}`}
                   >
-                    {!isBackendOnline ? (
-                      <span className="flex items-center justify-center">
-                        API DESCONECTADA
-                      </span>
-                    ) : status === ProcessingStatus.PROCESSING ? (
-                      <span className="flex items-center justify-center">
-                        <Loader2Icon className="w-5 h-5 mr-3 animate-spin text-cyan-400" />
-                        PROCESSANDO...
-                      </span>
-                    ) : (
-                      <>
-                        <div className="absolute inset-0 bg-metallic-gradient opacity-90 group-hover:opacity-100 transition duration-300"></div>
-                        <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20"></div>
-                        <span className="relative z-10 flex items-center justify-center">
-                          INICIAR PROCESSO <ZapIcon className="w-5 h-5 ml-2 fill-white" />
-                        </span>
-                      </>
-                    )}
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-all duration-300 ${autoDownload ? 'translate-x-5' : ''}`} />
                   </button>
-                  
-                  {!isBackendOnline && (
-                    <p className="text-[10px] text-red-400 text-center">
-                      Certifique-se que o Docker está rodando em {getApiBase()}
-                    </p>
+                </div>
+
+                <div className="h-px bg-white/5" />
+
+                {/* Process button */}
+                <button
+                  onClick={handleProcessAll}
+                  disabled={idleCount === 0 || !isBackendOnline}
+                  className={`
+                    relative w-full py-4 rounded-xl font-display font-bold text-lg tracking-widest uppercase transition-all duration-300 overflow-hidden group
+                    ${idleCount === 0 || !isBackendOnline
+                      ? 'bg-slate-800/50 text-slate-500 cursor-not-allowed border border-white/5'
+                      : 'text-white'
+                    }
+                  `}
+                >
+                  {!isBackendOnline ? (
+                    <span className="flex items-center justify-center text-base">API DESCONECTADA</span>
+                  ) : idleCount === 0 ? (
+                    <span className="flex items-center justify-center text-base">
+                      {activeCount > 0
+                        ? <><Loader2Icon className="w-5 h-5 mr-2 animate-spin text-cyan-400" />PROCESSANDO...</>
+                        : 'TUDO PROCESSADO'
+                      }
+                    </span>
+                  ) : (
+                    <>
+                      <div className="absolute inset-0 bg-metallic-gradient opacity-90 group-hover:opacity-100 transition duration-300" />
+                      <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20" />
+                      <span className="relative z-10 flex items-center justify-center">
+                        PROCESSAR {idleCount} ARQUIVO{idleCount !== 1 ? 'S' : ''}
+                        <ZapIcon className="w-5 h-5 ml-2 fill-white" />
+                      </span>
+                    </>
                   )}
+                </button>
+
+                {!isBackendOnline && (
+                  <p className="text-[10px] text-red-400 text-center">
+                    Docker não encontrado em {getApiBase()}
+                  </p>
+                )}
+
+                {/* Queue management */}
+                <div className="flex justify-between text-[10px] font-mono text-slate-600">
+                  {completedCount > 0 && (
+                    <button onClick={handleClearCompleted} className="hover:text-green-400 transition">
+                      Limpar concluídos
+                    </button>
+                  )}
+                  <button onClick={handleClearAll} className="hover:text-red-400 transition ml-auto">
+                    Limpar tudo
+                  </button>
                 </div>
               </div>
-            </div>
+            )}
+
+            {/* Empty state hint */}
+            {queue.length === 0 && (
+              <div className="flex items-center gap-2 text-slate-600 text-xs font-mono justify-center mt-2">
+                <span>Múltiplos arquivos suportados</span>
+              </div>
+            )}
           </div>
 
-          {/* RIGHT: Output Display */}
-          <div className="lg:col-span-7">
-             <div className="h-full min-h-[500px] bg-cyber-panel border border-white/10 rounded-3xl overflow-hidden relative flex flex-col shadow-2xl">
-                
-                {/* Header of Panel */}
-                <div className="h-14 border-b border-white/5 bg-black/20 flex items-center justify-between px-6 z-20">
-                  <div className="flex space-x-2">
-                    <div className="w-3 h-3 rounded-full bg-red-500/20 border border-red-500/50"></div>
-                    <div className="w-3 h-3 rounded-full bg-yellow-500/20 border border-yellow-500/50"></div>
-                    <div className="w-3 h-3 rounded-full bg-green-500/20 border border-green-500/50"></div>
-                  </div>
-                  
-                  {/* View Toggle (Only visible when completed) */}
-                  {status === ProcessingStatus.COMPLETED && result && (
-                    <div className="flex bg-black/50 rounded-lg p-1 border border-white/10">
-                      <button
-                        onClick={() => setViewMode('original')}
-                        className={`px-3 py-1 rounded text-xs font-bold transition-all ${viewMode === 'original' ? 'bg-white/20 text-white' : 'text-slate-500 hover:text-slate-300'}`}
-                      >
-                        ORIGINAL
-                      </button>
-                      <button
-                        onClick={() => setViewMode('processed')}
-                        className={`px-3 py-1 rounded text-xs font-bold transition-all ${viewMode === 'processed' ? 'bg-cyber-purple text-white' : 'text-slate-500 hover:text-slate-300'}`}
-                      >
-                        RESULTADO ({getSpeedNumber()}x)
-                      </button>
-                    </div>
-                  )}
+          {/* ── RIGHT: Queue panel ───────────────────────────────────────── */}
+          <div className="lg:col-span-8">
+            <div className="h-full min-h-[540px] bg-cyber-panel border border-white/10 rounded-3xl overflow-hidden flex flex-col shadow-2xl">
 
-                  <div className="text-[10px] uppercase tracking-widest text-slate-500 font-mono hidden sm:block">
-                    Modulo_Previa_v1
+              {/* Panel header */}
+              <div className="h-14 border-b border-white/5 bg-black/20 flex items-center justify-between px-5 flex-shrink-0">
+                <div className="flex items-center space-x-3">
+                  <div className="flex space-x-1.5">
+                    <div className="w-3 h-3 rounded-full bg-red-500/20 border border-red-500/50" />
+                    <div className="w-3 h-3 rounded-full bg-yellow-500/20 border border-yellow-500/50" />
+                    <div className="w-3 h-3 rounded-full bg-green-500/20 border border-green-500/50" />
                   </div>
+                  <span className="text-[11px] font-mono text-slate-500 tracking-wide uppercase">
+                    Fila de processamento
+                    {queue.length > 0 && <span className="ml-2 text-slate-400">· {queue.length} arquivo{queue.length !== 1 ? 's' : ''}</span>}
+                  </span>
                 </div>
+              </div>
 
-                {/* Content Area */}
-                <div className="flex-1 relative flex items-center justify-center bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-slate-900 to-black p-6">
-                  
-                  {status === ProcessingStatus.COMPLETED && result ? (
-                    <div className="w-full h-full flex flex-col animate-in fade-in duration-700">
-                       <div className="flex-1 bg-black rounded-xl overflow-hidden shadow-2xl border border-white/10 relative group">
-                          
-                          {/* Video Player */}
-                          <video 
-                            key={viewMode} // Force re-render on switch
-                            ref={videoRef}
-                            src={viewMode === 'original' && videoFile ? videoFile.previewUrl : result.downloadUrl} 
-                            className="w-full h-full object-contain"
-                            controls
-                            autoPlay
-                          />
-                          
-                          {/* Label Overlay */}
-                          <div className="absolute top-4 left-4 px-3 py-1 bg-black/60 backdrop-blur border border-white/10 rounded text-xs font-mono text-white/80 pointer-events-none">
-                            {viewMode === 'original' ? 'VÍDEO ORIGINAL' : `VÍDEO ACELERADO (${getSpeedNumber()}x)`}
-                          </div>
-                       </div>
-                       
-                       <div className="mt-6 flex flex-col sm:flex-row items-center justify-between gap-4">
-                          <div className="flex items-center space-x-4">
-                             <div className="flex items-center text-green-400 font-bold font-display text-lg">
-                                <CheckCircleIcon className="w-5 h-5 mr-2" />
-                                RENDERIZAÇÃO COMPLETA
-                             </div>
-                             <div className="h-4 w-px bg-white/10 hidden sm:block"></div>
-                             <div className="flex items-center text-xs text-slate-400 cursor-help" title="Alterne a visualização acima para comparar">
-                                <LayersIcon className="w-4 h-4 mr-1" />
-                                Modo de Comparação Ativo
-                             </div>
-                          </div>
-                          
-                          <a
-                            href={result.downloadUrl}
-                            download={result.processedName}
-                            className="w-full sm:w-auto flex items-center justify-center px-8 py-3 bg-white text-black rounded-lg font-bold hover:bg-cyan-50 hover:scale-105 transition duration-200 shadow-[0_0_20px_rgba(255,255,255,0.3)]"
-                          >
-                            <DownloadIcon className="w-5 h-5 mr-2" />
-                            BAIXAR MP4
-                          </a>
-                       </div>
-                    </div>
-                  ) : status === ProcessingStatus.ERROR ? (
-                    <div className="text-center">
-                       <div className="w-20 h-20 bg-red-500/10 rounded-full flex items-center justify-center mx-auto mb-6 border border-red-500/30 shadow-[0_0_30px_rgba(239,68,68,0.2)]">
-                          <span className="text-3xl">⚠️</span>
-                       </div>
-                       <h3 className="text-xl font-display font-bold text-white mb-2">Falha no Sistema</h3>
-                       <p className="text-red-400 max-w-sm mx-auto bg-red-950/30 p-4 rounded border border-red-900/50 font-mono text-xs">
-                         {error}
-                       </p>
-                       <button onClick={() => setStatus(ProcessingStatus.IDLE)} className="mt-6 text-slate-400 hover:text-white underline text-sm">Reiniciar Sistema</button>
-                    </div>
-                  ) : status === ProcessingStatus.PROCESSING ? (
-                    <div className="w-full max-w-md space-y-8">
-                       <div className="text-center">
-                         <div className="relative w-24 h-24 mx-auto mb-6">
-                            <div className="absolute inset-0 rounded-full border-t-2 border-l-2 border-cyber-purple animate-spin"></div>
-                            <div className="absolute inset-2 rounded-full border-r-2 border-b-2 border-cyber-blue animate-spin animation-delay-150"></div>
-                            <div className="absolute inset-0 flex items-center justify-center">
-                               <ZapIcon className="w-8 h-8 text-white animate-pulse" />
-                            </div>
-                         </div>
-                         <h3 className="text-2xl font-display font-bold text-white tracking-widest animate-pulse">PROCESSANDO</h3>
-                         <p className="text-cyan-400/60 font-mono text-xs mt-2">Executando algoritmo de aceleração FFmpeg...</p>
-                       </div>
-
-                       {/* Fake Progress Bar */}
-                       <div className="space-y-2">
-                         <div className="h-2 w-full bg-slate-800 rounded-full overflow-hidden border border-white/5">
-                           <div 
-                              className="h-full bg-metallic-gradient transition-all duration-300 ease-out"
-                              style={{ width: `${simulatedProgress}%` }}
-                           ></div>
-                         </div>
-                         <div className="flex justify-between text-[10px] font-mono text-slate-500">
-                           <span>ENVIANDO & PROCESSANDO</span>
-                           <span>{Math.round(simulatedProgress)}%</span>
-                         </div>
-                       </div>
-                    </div>
-                  ) : (
+              {/* Queue list */}
+              <div className="flex-1 overflow-y-auto bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-slate-900 to-black">
+                {queue.length === 0 ? (
+                  <div className="h-full flex items-center justify-center p-6">
                     <div className="text-center opacity-30 select-none">
-                       <PlayIcon className="w-24 h-24 mx-auto mb-4 text-white" />
-                       <h3 className="text-3xl font-display font-bold text-white tracking-widest">AGUARDANDO ARQUIVO</h3>
-                       <p className="text-sm font-mono mt-2">Selecione um arquivo para começar</p>
+                      <PlayIcon className="w-20 h-20 mx-auto mb-4 text-white" />
+                      <h3 className="text-2xl font-display font-bold text-white tracking-widest">FILA VAZIA</h3>
+                      <p className="text-sm font-mono mt-2">Arraste vídeos para o dropzone para começar</p>
                     </div>
-                  )}
-
-                </div>
-             </div>
+                  </div>
+                ) : (
+                  <div className="p-4 space-y-2">
+                    {queue.map(item => (
+                      <QueueCard
+                        key={item.id}
+                        item={item}
+                        onRemove={handleRemoveItem}
+                        onUpdate={(id, updates) => updateItem(id, updates)}
+                        onRetry={(id) => updateItem(id, { status: ProcessingStatus.IDLE, progress: 0, error: undefined })}
+                        onPreview={(id) => setPreviewItemId(id)}
+                        onDownload={triggerDownload}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
         </div>
       </main>
+
+      {/* ── Video Preview Modal ─────────────────────────────────────────────── */}
+      {previewItem && previewItem.result && (
+        <VideoPreviewModal
+          item={previewItem}
+          onClose={() => setPreviewItemId(null)}
+          onDownload={triggerDownload}
+        />
+      )}
+    </div>
+  );
+};
+
+// ─── Queue Item Card ──────────────────────────────────────────────────────────
+
+interface QueueCardProps {
+  item: QueueItem;
+  onRemove: (id: string) => void;
+  onUpdate: (id: string, updates: Partial<QueueItem>) => void;
+  onRetry: (id: string) => void;
+  onPreview: (id: string) => void;
+  onDownload: (url: string, filename: string) => void;
+}
+
+const QueueCard: React.FC<QueueCardProps> = ({ item, onRemove, onUpdate, onRetry, onPreview, onDownload }) => {
+  const isActive = item.status === ProcessingStatus.PROCESSING || item.status === ProcessingStatus.QUEUED;
+  const isIdle   = item.status === ProcessingStatus.IDLE;
+
+  return (
+    <div className="bg-black/40 border border-white/5 rounded-xl overflow-hidden hover:border-white/10 transition-all duration-200 group">
+
+      {/* ── Info row ─────────────────────────────────────────────────────── */}
+      <div className="flex items-start gap-3 p-3">
+        {/* Thumbnail */}
+        <div className="w-[80px] h-[50px] flex-shrink-0 rounded-lg overflow-hidden bg-slate-900 border border-white/5">
+          {item.thumbnailUrl ? (
+            <img src={item.thumbnailUrl} alt="" className="w-full h-full object-cover" />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center">
+              <FileVideoIcon className="w-5 h-5 text-slate-700" />
+            </div>
+          )}
+        </div>
+
+        {/* Text info */}
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-white truncate leading-snug">{item.file.name}</p>
+          {item.metadata ? (
+            <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+              {item.metadata.width}×{item.metadata.height}
+              {' · '}
+              {formatDuration(item.metadata.duration)}
+              {' → '}
+              <span className="text-cyan-400/80">{formatDuration(item.metadata.duration / item.speed)}</span>
+              {' · '}
+              {item.metadata.sizeMb.toFixed(1)} MB
+            </p>
+          ) : (
+            <p className="text-[10px] text-slate-600 font-mono mt-0.5">
+              {(item.file.size / (1024 * 1024)).toFixed(1)} MB
+            </p>
+          )}
+        </div>
+
+        {/* Status + remove */}
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <StatusBadge status={item.status} />
+          <button
+            onClick={() => onRemove(item.id)}
+            title={isActive ? 'Cancelar' : 'Remover'}
+            className="p-1 text-slate-600 hover:text-red-400 transition rounded opacity-0 group-hover:opacity-100"
+          >
+            <XIcon className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* ── Settings row (IDLE only) ─────────────────────────────────────── */}
+      {isIdle && (
+        <div className="px-3 pb-3 border-t border-white/5 pt-2.5 flex items-center gap-3">
+
+          {/* Speed value (direct input) */}
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            <input
+              type="number"
+              min={0.1}
+              max={10}
+              step={0.1}
+              value={item.speed}
+              onChange={e => {
+                const v = parseFloat(e.target.value);
+                if (!isNaN(v) && v >= 0.1 && v <= 10) onUpdate(item.id, { speed: Math.round(v * 10) / 10 });
+              }}
+              className="w-14 bg-black/50 border border-white/10 rounded-md py-1 text-center font-mono text-sm text-cyan-400 font-bold focus:outline-none focus:border-cyber-purple transition-all"
+            />
+            <span className="text-slate-600 text-xs font-mono">×</span>
+          </div>
+
+          {/* Speed slider */}
+          <input
+            type="range"
+            min={0.25}
+            max={5}
+            step={0.05}
+            value={item.speed}
+            onChange={e => onUpdate(item.id, { speed: Math.round(parseFloat(e.target.value) * 100) / 100 })}
+            className="flex-1 min-w-0"
+          />
+
+          {/* Quality preset pills */}
+          <div className="flex gap-1 flex-shrink-0">
+            {(Object.keys(QUALITY_PRESETS) as QualityPreset[]).map(key => (
+              <button
+                key={key}
+                onClick={() => onUpdate(item.id, { qualityPreset: key })}
+                className={`text-[9px] font-mono font-bold px-2 py-1 rounded-md transition-all ${
+                  item.qualityPreset === key
+                    ? 'bg-cyber-purple text-white'
+                    : 'bg-white/5 text-slate-500 hover:bg-white/10 hover:text-slate-300'
+                }`}
+              >
+                {QUALITY_PRESETS[key].label}
+              </button>
+            ))}
+          </div>
+
+          {/* Mute toggle */}
+          <button
+            onClick={() => onUpdate(item.id, { muteAudio: !item.muteAudio })}
+            title={item.muteAudio ? 'Áudio removido — clique para ativar' : 'Áudio ativo — clique para remover'}
+            className={`flex-shrink-0 p-1.5 rounded-lg transition-all ${
+              item.muteAudio
+                ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                : 'bg-white/5 text-slate-500 hover:text-slate-300 hover:bg-white/10'
+            }`}
+          >
+            {item.muteAudio ? <VolumeXIcon className="w-3.5 h-3.5" /> : <Volume2Icon className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+      )}
+
+      {/* ── Progress bar (QUEUED / PROCESSING) ──────────────────────────── */}
+      {isActive && (
+        <div className="px-3 pb-3">
+          <div className="h-1 w-full bg-slate-800 rounded-full overflow-hidden">
+            {item.status === ProcessingStatus.QUEUED ? (
+              <div className="h-full w-full bg-amber-500/40 animate-pulse" />
+            ) : (
+              <div
+                className="h-full bg-cyber-purple transition-all duration-300 ease-out"
+                style={{ width: `${item.progress}%` }}
+              />
+            )}
+          </div>
+          <div className="flex justify-between text-[9px] font-mono text-slate-600 mt-1">
+            <span>{item.status === ProcessingStatus.QUEUED ? 'AGUARDANDO SLOT...' : 'PROCESSANDO'}</span>
+            {item.status === ProcessingStatus.PROCESSING && <span>{Math.round(item.progress)}%</span>}
+          </div>
+        </div>
+      )}
+
+      {/* ── Completed actions ────────────────────────────────────────────── */}
+      {item.status === ProcessingStatus.COMPLETED && item.result && (
+        <div className="px-3 pb-3 flex items-center justify-between border-t border-white/5 pt-2.5">
+          <div className="flex items-center text-xs text-green-400 gap-1.5">
+            <CheckCircleIcon className="w-3.5 h-3.5" />
+            Concluído
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onPreview(item.id)}
+              className="flex items-center gap-1.5 text-xs font-bold text-slate-300 bg-white/5 hover:bg-white/15 px-3 py-1.5 rounded-lg transition border border-white/5 hover:border-cyber-purple/40"
+            >
+              <PlayCircleIcon className="w-3.5 h-3.5" />
+              VISUALIZAR
+            </button>
+            <button
+              onClick={() => onDownload(item.result!.downloadUrl, item.result!.processedName)}
+              className="flex items-center gap-1.5 text-xs font-bold text-white bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-lg transition"
+            >
+              <DownloadIcon className="w-3.5 h-3.5" />
+              BAIXAR MP4
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Error ────────────────────────────────────────────────────────── */}
+      {item.status === ProcessingStatus.ERROR && (
+        <div className="px-3 pb-3 flex items-center justify-between gap-3 border-t border-white/5 pt-2.5">
+          <p className="text-[10px] text-red-400 font-mono truncate flex-1">{item.error}</p>
+          <button
+            onClick={() => onRetry(item.id)}
+            className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-white transition flex-shrink-0"
+          >
+            <RefreshIcon className="w-3 h-3" />
+            Tentar novamente
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── Video Preview Modal ──────────────────────────────────────────────────────
+
+interface VideoPreviewModalProps {
+  item: QueueItem;
+  onClose: () => void;
+  onDownload: (url: string, filename: string) => void;
+}
+
+const VideoPreviewModal: React.FC<VideoPreviewModalProps> = ({ item, onClose, onDownload }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Close on Escape
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  if (!item.result) return null;
+
+  const qualityLabel = QUALITY_PRESETS[item.qualityPreset].label;
+  const outputDuration = item.metadata
+    ? formatDuration(item.metadata.duration / item.speed)
+    : null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-black/80 backdrop-blur-md" />
+
+      {/* Modal */}
+      <div
+        className="relative z-10 w-full max-w-3xl bg-cyber-panel border border-white/10 rounded-3xl overflow-hidden shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Modal header */}
+        <div className="flex items-start justify-between p-5 border-b border-white/5">
+          <div className="min-w-0 flex-1 mr-4">
+            <p className="text-sm font-medium text-white truncate">{item.file.name}</p>
+            <p className="text-[10px] font-mono text-slate-500 mt-0.5">
+              {item.metadata && `${item.metadata.width}×${item.metadata.height} · `}
+              {outputDuration && `${outputDuration} · `}
+              {item.speed.toFixed(1)}× · {qualityLabel}
+              {item.muteAudio && ' · Sem áudio'}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="flex-shrink-0 p-2 text-slate-500 hover:text-white bg-white/5 hover:bg-white/10 rounded-xl transition"
+          >
+            <XIcon className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Video player */}
+        <div className="bg-black relative">
+          <video
+            ref={videoRef}
+            src={item.result.downloadUrl}
+            controls
+            autoPlay
+            className="w-full max-h-[65vh] object-contain"
+          />
+        </div>
+
+        {/* Modal footer */}
+        <div className="flex items-center justify-end gap-3 p-4 border-t border-white/5">
+          <button
+            onClick={() => onDownload(item.result!.downloadUrl, item.result!.processedName)}
+            className="flex items-center gap-2 text-sm font-bold text-white bg-white/10 hover:bg-white/20 px-4 py-2 rounded-xl transition"
+          >
+            <DownloadIcon className="w-4 h-4" />
+            BAIXAR MP4
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
