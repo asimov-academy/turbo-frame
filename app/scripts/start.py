@@ -170,7 +170,7 @@ def start_docker_services(docker_compose_cmd):
     console.print("[dim]Construindo e iniciando containers...[/dim]")
     
     process = subprocess.Popen(
-        docker_compose_cmd.split() + ["up", "--build", "-d"],
+        docker_compose_cmd.split() + ["up", "--build", "--no-cache", "-d"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
