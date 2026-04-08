@@ -1,0 +1,16 @@
+# Override para ambiente de desenvolvimento local.
+# Este arquivo é aplicado automaticamente pelo Docker Compose sobre o docker-compose.yml.
+# Os limites de produção (cpus: '20', memory: 32G) ficam no arquivo principal e
+# são usados no servidor de 32 cores / 125 GB.
+# Aqui sobrescrevemos para valores compatíveis com a máquina local.
+
+services:
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: '7'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
