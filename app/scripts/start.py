@@ -166,35 +166,46 @@ def start_docker_services(docker_compose_cmd):
         text=True
     )
     
-    # Construir e iniciar
-    console.print("[dim]Construindo e iniciando containers...[/dim]")
-    
-    process = subprocess.Popen(
-        docker_compose_cmd.split() + ["up", "--build", "--no-cache", "-d"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-    
-    # Mostrar output em tempo real com prefixo
+    # Construir sem cache e depois subir
+    console.print("[dim]Construindo imagens (sem cache)...[/dim]")
+
     output_lines = []
-    for line in process.stdout:
-        if line.strip():
-            clean_line = line.strip()
-            output_lines.append(clean_line)
-            # Mostrar apenas linhas importantes
-            if any(keyword in clean_line.lower() for keyword in ['building', 'creating', 'starting', 'started', 'error', 'warning']):
-                console.print(f"[dim]  → {clean_line}[/dim]")
-    
-    process.wait()
-    
-    if process.returncode == 0:
+
+    def _run_and_stream(cmd):
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        for line in proc.stdout:
+            if line.strip():
+                clean_line = line.strip()
+                output_lines.append(clean_line)
+                if any(k in clean_line.lower() for k in ['building', 'creating', 'starting', 'started', 'error', 'warning']):
+                    console.print(f"[dim]  → {clean_line}[/dim]")
+        proc.wait()
+        return proc.returncode
+
+    build_rc = _run_and_stream(docker_compose_cmd.split() + ["build", "--no-cache"])
+    if build_rc != 0:
+        console.print(f"[{ERROR}]✗ Erro ao construir imagens Docker[/{ERROR}]")
+        if output_lines:
+            console.print("[dim]Últimas linhas de output:[/dim]")
+            for line in output_lines[-5:]:
+                console.print(f"[dim]  {line}[/dim]")
+        return False
+
+    console.print(f"[{SUCCESS}]✓ Imagens construídas[/{SUCCESS}]")
+    console.print("[dim]Iniciando containers...[/dim]")
+
+    up_rc = _run_and_stream(docker_compose_cmd.split() + ["up", "-d"])
+    if up_rc == 0:
         console.print(f"[{SUCCESS}]✓ Serviços Docker iniciados com sucesso[/{SUCCESS}]")
         return True
     else:
         console.print(f"[{ERROR}]✗ Erro ao iniciar serviços Docker[/{ERROR}]")
-        # Mostrar últimas linhas de erro
         if output_lines:
             console.print("[dim]Últimas linhas de output:[/dim]")
             for line in output_lines[-5:]:
