@@ -19,6 +19,8 @@ export const getApiBase = (): string => {
 
 const API_BASE = getApiBase();
 
+const SSE_IDLE_TIMEOUT_MS = 120000;
+
 export const checkBackendHealth = async (): Promise<boolean> => {
   try {
     const res = await fetch(`${API_BASE}/health`, { method: 'GET' });
@@ -89,12 +91,20 @@ export const accelerateVideo = async (
             reject(new DOMException('Cancelado pelo usuário', 'AbortError'));
           });
 
-          const sseTimeout = setTimeout(() => {
-            eventSource.close();
-            reject(new Error('Tempo limite de processamento excedido (10 minutos)'));
-          }, 600000);
+          // Timeout por inatividade, não pelo tempo total: vídeos longos ou jobs esperando
+          // na fila podem passar de 10 min. O backend reenvia o status a cada 15s.
+          let sseTimeout: ReturnType<typeof setTimeout>;
+          const armSseTimeout = () => {
+            clearTimeout(sseTimeout);
+            sseTimeout = setTimeout(() => {
+              eventSource.close();
+              reject(new Error('Servidor parou de responder (2 minutos sem atualização)'));
+            }, SSE_IDLE_TIMEOUT_MS);
+          };
+          armSseTimeout();
 
           eventSource.onmessage = (event) => {
+            armSseTimeout();
             try {
               const data = JSON.parse(event.data);
 
@@ -169,12 +179,7 @@ export const accelerateVideo = async (
       reject(new Error(`Erro de conexão. Verifique se o servidor está rodando em ${API_BASE}`));
     });
 
-    xhr.addEventListener('timeout', () => {
-      reject(new Error('Tempo limite excedido no upload.'));
-    });
-
-    xhr.timeout = 300000;
-
+    // Sem xhr.timeout: vídeos de vários GB levam mais de 5 min para subir pela rede.
     xhr.open('POST', url.toString());
     xhr.send(formData);
   });

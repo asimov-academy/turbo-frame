@@ -2,8 +2,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from starlette.background import BackgroundTask
 import os
+import shutil
 import uuid
 import logging
 import asyncio
@@ -162,9 +164,10 @@ async def accelerate_endpoint(
 
     size_str = f"{file.size} bytes" if file.size is not None else "tamanho desconhecido"
     logger.info(f"Iniciando upload do arquivo: {file.filename} ({size_str})")
+    # Copia em blocos numa thread: ler o vídeo inteiro com file.read() colocava o arquivo
+    # todo na RAM e, com vários uploads simultâneos, estourava o limite de memória do container.
     with open(input_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        await run_in_threadpool(shutil.copyfileobj, file.file, f, 1024 * 1024)
     logger.info(f"Arquivo salvo em: {input_path} ({input_path.stat().st_size} bytes)")
 
     if use_sse:
@@ -299,6 +302,7 @@ async def stream_progress(job_id: str):
     async def event_generator():
         last_progress = -1.0
         last_status = None
+        last_sent = 0.0
 
         while True:
             if job_id not in processing_status:
@@ -309,8 +313,11 @@ async def stream_progress(job_id: str):
             current_progress = status.get("progress", 0.0)
             current_status = status.get("status", "unknown")
 
-            # Emitir quando progresso OU status mudar
-            if current_progress != last_progress or current_status != last_status:
+            # Emitir quando progresso OU status mudar, e reenviar a cada 15s mesmo parado
+            # (job na fila do semáforo) para o frontend saber que a conexão segue viva
+            changed = current_progress != last_progress or current_status != last_status
+            if changed or time.monotonic() - last_sent >= 15:
+                last_sent = time.monotonic()
                 data = {
                     "progress": current_progress,
                     "status": current_status,
