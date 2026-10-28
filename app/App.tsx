@@ -76,6 +76,10 @@ const extractThumbnail = (file: File): Promise<string> =>
     video.src = URL.createObjectURL(file);
   });
 
+// Quantos vídeos desta aba sobem/processam ao mesmo tempo. O servidor tem 6 slots
+// para o time inteiro (JOB_SEMAPHORE); 1 por editora evita que um lote monopolize a máquina.
+const MAX_PARALLEL_JOBS = 1;
+
 // ─── Status badge ────────────────────────────────────────────────────────────
 
 const STATUS_CONFIG: Record<ProcessingStatus, { label: string; className: string }> = {
@@ -114,6 +118,14 @@ const App: React.FC = () => {
     typeof Notification !== 'undefined' ? Notification.permission : 'denied'
   );
   const [previewItemId, setPreviewItemId] = useState<string | null>(null);
+
+  // Refs lidas pelos jobs do lote, que terminam muito depois do render que os iniciou
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const autoDownloadRef = useRef(autoDownload);
+  autoDownloadRef.current = autoDownload;
+  const pendingIdsRef = useRef<string[]>([]);
+  const runningCountRef = useRef(0);
 
   // ── Derived counts ──────────────────────────────────────────────────────────
   const idleCount      = queue.filter(i => i.status === ProcessingStatus.IDLE).length;
@@ -194,10 +206,8 @@ const App: React.FC = () => {
   };
 
   // ── Process a single queue item ─────────────────────────────────────────────
-  const processItem = async (itemId: string) => {
-    const item = queue.find(i => i.id === itemId);
-    if (!item || item.status !== ProcessingStatus.IDLE) return;
-
+  const processItem = async (item: QueueItem) => {
+    const itemId = item.id;
     const { preset, crf } = QUALITY_PRESETS[item.qualityPreset];
     const controller = new AbortController();
 
@@ -252,7 +262,7 @@ const App: React.FC = () => {
         });
       }
 
-      if (autoDownload) triggerDownload(data.downloadUrl, data.processedName);
+      if (autoDownloadRef.current) triggerDownload(data.downloadUrl, data.processedName);
 
     } catch (err: unknown) {
       clearInterval(fallbackInterval);
@@ -265,8 +275,29 @@ const App: React.FC = () => {
     }
   };
 
+  // Disparar todos de uma vez dividia a banda entre os uploads e derrubava a API por
+  // falta de memória: só o primeiro concluía. Agora o lote entra na fila e sai em ordem.
+  const startNextJobs = () => {
+    while (runningCountRef.current < MAX_PARALLEL_JOBS && pendingIdsRef.current.length) {
+      const id = pendingIdsRef.current.shift()!;
+      const item = queueRef.current.find(i => i.id === id);
+      if (!item) continue; // removido enquanto esperava a vez
+      runningCountRef.current++;
+      processItem(item).finally(() => {
+        runningCountRef.current--;
+        startNextJobs();
+      });
+    }
+  };
+
   const handleProcessAll = () => {
-    queue.filter(i => i.status === ProcessingStatus.IDLE).forEach(i => processItem(i.id));
+    const ids = queue.filter(i => i.status === ProcessingStatus.IDLE).map(i => i.id);
+    if (!ids.length) return;
+    setQueue(prev => prev.map(i => ids.includes(i.id)
+      ? { ...i, status: ProcessingStatus.QUEUED, progress: 0, error: undefined }
+      : i));
+    pendingIdsRef.current.push(...ids);
+    startNextJobs();
   };
 
   const triggerDownload = (url: string, filename: string) => {
